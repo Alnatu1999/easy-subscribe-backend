@@ -9,26 +9,25 @@ const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const { connectDB, User, Transaction, AdminRole, Notification, Commission } = require('./db.js');
-
 dotenv.config();
 const app = express();
 app.use(helmet());
-
 // Enhanced CORS configuration - UPDATED FOR PRODUCTION
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5500',
   'http://127.0.0.1:5500',
-  process.env.FRONTEND_URL || 'https://easy-subscribe-frontend.onrender.com' // Updated with actual URL
+  process.env.FRONTEND_URL || 'https://easy-subscribe-frontend.onrender.com'
 ];
-
 // Remove duplicate origins
 const uniqueOrigins = [...new Set(allowedOrigins)];
-
 app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
+    
+    // Allow requests with origin 'null' (sandboxed iframes, etc.)
+    if (origin === 'null') return callback(null, true);
     
     if (uniqueOrigins.indexOf(origin) !== -1) {
       callback(null, true);
@@ -41,9 +40,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-
 app.use(express.json({ limit: '1mb' }));
-
 // Rate limiting
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -53,10 +50,8 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 app.use('/api/auth/', authLimiter);
-
 // Connect to Database
 connectDB();
-
 // Constants - UPDATED FOR PRODUCTION
 const PORT = process.env.PORT || 5001;
 const APP_BASE_URL = process.env.APP_BASE_URL || (process.env.NODE_ENV === 'production' 
@@ -64,7 +59,6 @@ const APP_BASE_URL = process.env.APP_BASE_URL || (process.env.NODE_ENV === 'prod
   : 'http://localhost:5173');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'your-refresh-secret';
-
 // Middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -78,7 +72,6 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
-
 const authorizeRole = (roles) => {
   return (req, res, next) => {
     if (!req.user) return response(res, false, null, 'Unauthorized', 401);
@@ -90,7 +83,6 @@ const authorizeRole = (roles) => {
     next();
   };
 };
-
 // Helper Functions
 function response(res, success, data = null, message = '', code = 200) {
   return res.status(code).json({
@@ -100,29 +92,24 @@ function response(res, success, data = null, message = '', code = 200) {
     timestamp: new Date().toISOString()
   });
 }
-
 function required(obj, keys) { 
   for (const k of keys) if (!obj[k]) return k; 
   return null; 
 }
-
 // Generate Reference
 function generateReference(prefix = 'TXN') {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
 }
-
 // Validate email format
 function isValidEmail(email) {
   const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return re.test(String(email).toLowerCase());
 }
-
 // Validate phone number format (Nigerian format)
 function isValidPhone(phone) {
   const re = /^(0|234)(7|8|9)[01]\d{8}$/;
   return re.test(String(phone));
 }
-
 // Send Email
 const sendEmail = async (to, subject, html) => {
   try {
@@ -147,7 +134,6 @@ const sendEmail = async (to, subject, html) => {
     // Don't fail the whole process if email fails
   }
 };
-
 // Generate JWT tokens
 function generateTokens(user) {
   const accessToken = jwt.sign(
@@ -164,7 +150,6 @@ function generateTokens(user) {
   
   return { accessToken, refreshToken };
 }
-
 // Authentication Routes
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -237,7 +222,6 @@ app.post('/api/auth/register', async (req, res) => {
     response(res, false, null, 'Registration failed', 500);
   }
 });
-
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -282,7 +266,6 @@ app.post('/api/auth/login', async (req, res) => {
     response(res, false, null, 'Login failed', 500);
   }
 });
-
 app.post('/api/auth/refresh-token', async (req, res) => {
   try {
     const { refreshToken } = req.body;
@@ -308,7 +291,6 @@ app.post('/api/auth/refresh-token', async (req, res) => {
     response(res, false, null, 'Failed to refresh token', 500);
   }
 });
-
 app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
@@ -353,7 +335,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     response(res, false, null, 'Failed to process password reset request', 500);
   }
 });
-
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const { token, password } = req.body;
@@ -400,7 +381,6 @@ app.post('/api/auth/reset-password', async (req, res) => {
     response(res, false, null, 'Failed to reset password', 500);
   }
 });
-
 // User Routes
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
@@ -415,7 +395,6 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to get user profile', 500);
   }
 });
-
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const { name, phone } = req.body;
@@ -451,7 +430,6 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to update profile', 500);
   }
 });
-
 app.post('/api/user/change-password', authenticateToken, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
@@ -498,7 +476,6 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to change password', 500);
   }
 });
-
 // Notification Routes
 app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
@@ -531,7 +508,6 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to get notifications', 500);
   }
 });
-
 app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
   try {
     const notification = await Notification.findOne({
@@ -552,7 +528,6 @@ app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to mark notification as read', 500);
   }
 });
-
 app.put('/api/notifications/read-all', authenticateToken, async (req, res) => {
   try {
     await Notification.updateMany(
@@ -566,7 +541,6 @@ app.put('/api/notifications/read-all', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to mark notifications as read', 500);
   }
 });
-
 // Wallet Routes
 app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
   try {
@@ -581,7 +555,6 @@ app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to get wallet balance', 500);
   }
 });
-
 app.get('/api/wallet/transactions', authenticateToken, async (req, res) => {
   try {
     const { page = 1, limit = 10, type } = req.query;
@@ -611,7 +584,6 @@ app.get('/api/wallet/transactions', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to get wallet transactions', 500);
   }
 });
-
 // Service Routes
 app.post('/api/services/airtime', authenticateToken, async (req, res) => {
   try {
@@ -688,7 +660,6 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
     response(res, false, null, 'Airtime purchase failed', 500);
   }
 });
-
 app.post('/api/services/data', authenticateToken, async (req, res) => {
   try {
     const { network, phone, plan } = req.body;
@@ -777,7 +748,6 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
     response(res, false, null, 'Data purchase failed', 500);
   }
 });
-
 app.post('/api/services/electricity', authenticateToken, async (req, res) => {
   try {
     const { disco, meter, meterType, amount, phone, email } = req.body;
@@ -876,7 +846,6 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
     response(res, false, null, 'Electricity payment failed', 500);
   }
 });
-
 app.post('/api/services/tv', authenticateToken, async (req, res) => {
   try {
     const { provider, smartcard, plan, phone, email } = req.body;
@@ -994,7 +963,6 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
     response(res, false, null, 'TV subscription failed', 500);
   }
 });
-
 // Transaction Routes
 app.get('/api/transactions', authenticateToken, async (req, res) => {
   try {
@@ -1026,7 +994,6 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to get transactions', 500);
   }
 });
-
 app.get('/api/transactions/:reference', authenticateToken, async (req, res) => {
   try {
     const transaction = await Transaction.findOne({ 
@@ -1044,7 +1011,6 @@ app.get('/api/transactions/:reference', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to get transaction', 500);
   }
 });
-
 // Admin Routes
 app.get('/api/admin/stats', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
@@ -1071,7 +1037,6 @@ app.get('/api/admin/stats', authenticateToken, authorizeRole(['admin', 'super-ad
     response(res, false, null, 'Failed to get admin stats', 500);
   }
 });
-
 app.get('/api/admin/users', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const { page = 1, limit = 10, search } = req.query;
@@ -1109,7 +1074,6 @@ app.get('/api/admin/users', authenticateToken, authorizeRole(['admin', 'super-ad
     response(res, false, null, 'Failed to get users', 500);
   }
 });
-
 app.put('/api/admin/users/:id', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const { name, email, phone, role, isActive } = req.body;
@@ -1144,7 +1108,6 @@ app.put('/api/admin/users/:id', authenticateToken, authorizeRole(['admin', 'supe
     response(res, false, null, 'Failed to update user', 500);
   }
 });
-
 app.post('/api/admin/users/reset-password/:id', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
@@ -1178,7 +1141,6 @@ app.post('/api/admin/users/reset-password/:id', authenticateToken, authorizeRole
     response(res, false, null, 'Failed to reset password', 500);
   }
 });
-
 app.get('/api/admin/transactions', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const { page = 1, limit = 10, type, status, userId } = req.query;
@@ -1211,7 +1173,6 @@ app.get('/api/admin/transactions', authenticateToken, authorizeRole(['admin', 's
     response(res, false, null, 'Failed to get transactions', 500);
   }
 });
-
 app.put('/api/admin/transactions/:id/verify', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const transaction = await Transaction.findById(req.params.id);
@@ -1228,7 +1189,6 @@ app.put('/api/admin/transactions/:id/verify', authenticateToken, authorizeRole([
     response(res, false, null, 'Failed to verify transaction', 500);
   }
 });
-
 app.get('/api/admin/commissions', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const { page = 1, limit = 10 } = req.query;
@@ -1257,7 +1217,6 @@ app.get('/api/admin/commissions', authenticateToken, authorizeRole(['admin', 'su
     response(res, false, null, 'Failed to get commissions', 500);
   }
 });
-
 app.post('/api/admin/commissions/pay/:id', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const commission = await Commission.findById(req.params.id);
@@ -1274,7 +1233,6 @@ app.post('/api/admin/commissions/pay/:id', authenticateToken, authorizeRole(['ad
     response(res, false, null, 'Failed to pay commission', 500);
   }
 });
-
 app.get('/api/admin/notifications', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const notifications = await Notification.find()
@@ -1288,7 +1246,6 @@ app.get('/api/admin/notifications', authenticateToken, authorizeRole(['admin', '
     response(res, false, null, 'Failed to get notifications', 500);
   }
 });
-
 app.post('/api/admin/notifications', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
     const { title, message, userId } = req.body;
@@ -1311,7 +1268,6 @@ app.post('/api/admin/notifications', authenticateToken, authorizeRole(['admin', 
     response(res, false, null, 'Failed to send notification', 500);
   }
 });
-
 // Service Processing Functions (Simplified for demo)
 async function processAirtimePurchase(network, phone, amount, reference) {
   // In a real app, this would integrate with a VTpass or similar API
@@ -1327,7 +1283,6 @@ async function processAirtimePurchase(network, phone, amount, reference) {
     return { success: false, message: 'Failed to process airtime purchase' };
   }
 }
-
 async function processDataPurchase(network, phone, plan, reference) {
   // In a real app, this would integrate with a VTpass or similar API
   console.log(`Processing data purchase: ${network} ${phone} ${plan} ${reference}`);
@@ -1342,7 +1297,6 @@ async function processDataPurchase(network, phone, plan, reference) {
     return { success: false, message: 'Failed to process data purchase' };
   }
 }
-
 async function processElectricityPayment(disco, meter, meterType, amount, reference) {
   // In a real app, this would integrate with a VTpass or similar API
   console.log(`Processing electricity payment: ${disco} ${meter} ${meterType} ₦${amount} ${reference}`);
@@ -1359,7 +1313,6 @@ async function processElectricityPayment(disco, meter, meterType, amount, refere
     return { success: false, message: 'Failed to process electricity payment' };
   }
 }
-
 async function processTVSubscription(provider, smartcard, plan, reference) {
   // In a real app, this would integrate with a VTpass or similar API
   console.log(`Processing TV subscription: ${provider} ${smartcard} ${plan} ${reference}`);
@@ -1374,12 +1327,10 @@ async function processTVSubscription(provider, smartcard, plan, reference) {
     return { success: false, message: 'Failed to process TV subscription' };
   }
 }
-
 // Health check
 app.get('/health', (req, res) => {
   response(res, true, { status: 'ok', time: new Date().toISOString() }, 'Health check');
 });
-
 // Start server - UPDATED FOR PRODUCTION
 app.listen(PORT, () => {
   console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
