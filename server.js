@@ -3,30 +3,34 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const dotenv = require('dotenv');
-const axios = require('axios');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const { connectDB, User, Transaction, AdminRole, Notification, Commission } = require('./db.js');
+
 dotenv.config();
 const app = express();
 app.use(helmet());
 
-// Enhanced CORS configuration - FIXED
+// Enhanced CORS configuration - UPDATED FOR PRODUCTION
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5500',
-  'http://127.0.0.1:5500'
+  'http://127.0.0.1:5500',
+  process.env.FRONTEND_URL || 'https://easy-subscribe-frontend.onrender.com' // Updated with actual URL
 ];
+
+// Remove duplicate origins
+const uniqueOrigins = [...new Set(allowedOrigins)];
 
 app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    if (uniqueOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
       console.log('Origin not allowed by CORS:', origin);
@@ -53,11 +57,11 @@ app.use('/api/auth/', authLimiter);
 // Connect to Database
 connectDB();
 
-// Constants
+// Constants - UPDATED FOR PRODUCTION
 const PORT = process.env.PORT || 5001;
-const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:5173';
-const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-const PAYSTACK_INIT_URL = 'https://api.paystack.co/transaction/initialize';
+const APP_BASE_URL = process.env.APP_BASE_URL || (process.env.NODE_ENV === 'production' 
+  ? 'https://easy-subscribe-frontend.onrender.com' // Updated with actual URL
+  : 'http://localhost:5173');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'your-refresh-secret';
 
@@ -160,130 +164,6 @@ function generateTokens(user) {
   
   return { accessToken, refreshToken };
 }
-
-// Bill Fulfilment Function (for webhooks)
-async function fulfilBill({ amount, email, serviceType, billersCode, serviceID, variation_code, phone, paystack_reference }) {
-  try {
-    const naira = Math.round(Number(amount || 0) / 100);
-    
-    // Find user by email
-    const user = await User.findOne({ email });
-    if (!user) {
-      return { success: false, error: 'User not found' };
-    }
-    
-    // Create transaction record
-    const reference = generateReference();
-    const transaction = new Transaction({
-      userId: user._id,
-      type: serviceType,
-      amount: naira,
-      reference,
-      status: 'pending',
-      metadata: {
-        billersCode,
-        serviceID,
-        variation_code,
-        phone,
-        paystack_reference
-      }
-    });
-    
-    await transaction.save();
-    
-    // Process based on service type
-    let result;
-    switch (serviceType) {
-      case 'airtime':
-        result = await processAirtimePurchase(serviceID, phone, naira, reference);
-        break;
-      case 'data':
-        result = await processDataPurchase(serviceID, phone, variation_code, reference);
-        break;
-      case 'electricity':
-        result = await processElectricityPayment(serviceID, billersCode, variation_code, naira, reference);
-        break;
-      case 'tv':
-        result = await processTVSubscription(serviceID, billersCode, variation_code, reference);
-        break;
-      case 'wallet-funding':
-        // Update wallet balance
-        user.walletBalance += naira;
-        await user.save();
-        result = { success: true };
-        break;
-      default:
-        result = { success: false, error: 'Unknown service type' };
-    }
-    
-    // Update transaction status
-    transaction.status = result.success ? 'successful' : 'failed';
-    if (result.token) {
-      transaction.metadata.token = result.token;
-    }
-    await transaction.save();
-    
-    // Send notification
-    const notification = new Notification({
-      userId: user._id,
-      title: `${serviceType} ${result.success ? 'Successful' : 'Failed'}`,
-      message: result.success 
-        ? `Your ${serviceType} transaction of ₦${naira} was successful. Reference: ${reference}`
-        : `Your ${serviceType} transaction failed. Please contact support.`
-    });
-    await notification.save();
-    
-    return { success: result.success };
-  } catch (err) {
-    console.error('FULFIL_BILL_ERR', err);
-    return { success: false, error: err.message };
-  }
-}
-
-// Webhook for Paystack
-app.post('/webhooks/paystack', express.raw({ type: '*/*' }), async (req, res) => {
-  try {
-    const signature = req.headers['x-paystack-signature'];
-    const hash = crypto.createHmac('sha512', PAYSTACK_SECRET).update(req.body).digest('hex');
-    
-    if (hash !== signature) {
-      console.error('Invalid webhook signature');
-      return response(res, false, null, 'Invalid signature', 401);
-    }
-    
-    const event = JSON.parse(req.body.toString());
-    
-    if (event?.event !== 'charge.success') {
-      return response(res, true, null, 'Ignored event', 200);
-    }
-    
-    const data = event?.data;
-    const amount = data?.amount; // kobo
-    const email = data?.customer?.email;
-    const meta = data?.metadata || {};
-    
-    const fulfil = await fulfilBill({
-      amount,
-      email,
-      serviceType: meta.serviceType,
-      billersCode: meta.billersCode,
-      serviceID: meta.serviceID,
-      variation_code: meta.variation_code,
-      phone: meta.phone,
-      paystack_reference: data?.reference,
-    });
-    
-    if (!fulfil?.success) {
-      console.error('FULFILMENT_FAILED', fulfil);
-      // You can alert admin or queue a retry here
-    }
-    
-    return response(res, true, null, 'OK', 200);
-  } catch (err) {
-    console.error('WEBHOOK_ERR', err?.message);
-    return response(res, false, null, 'Webhook processing failed', 500);
-  }
-});
 
 // Authentication Routes
 app.post('/api/auth/register', async (req, res) => {
@@ -688,130 +568,6 @@ app.put('/api/notifications/read-all', authenticateToken, async (req, res) => {
 });
 
 // Wallet Routes
-app.post('/api/wallet/fund', authenticateToken, async (req, res) => {
-  try {
-    const { amount, paymentMethod } = req.body;
-    
-    if (!amount || amount < 100) {
-      return response(res, false, null, 'Invalid amount (minimum ₦100)', 400);
-    }
-    
-    const user = await User.findById(req.user.id);
-    if (!user) {
-      return response(res, false, null, 'User not found', 404);
-    }
-    
-    const reference = generateReference('WALLET');
-    
-    // Initialize payment with Paystack
-    const initRes = await axios.post(PAYSTACK_INIT_URL, {
-      amount: amount * 100, // Convert to kobo
-      email: user.email,
-      metadata: {
-        userId: user._id,
-        serviceType: 'wallet-funding',
-        reference
-      },
-      callback_url: `${APP_BASE_URL}/payment-success.html`
-    }, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
-    });
-    
-    // Create transaction record
-    const transaction = new Transaction({
-      userId: user._id,
-      type: 'wallet-funding',
-      amount,
-      reference,
-      status: 'pending',
-      metadata: { paymentMethod }
-    });
-    
-    await transaction.save();
-    
-    response(res, true, {
-      authorization_url: initRes?.data?.data?.authorization_url,
-      reference
-    }, 'Wallet funding initiated');
-  } catch (err) {
-    console.error('WALLET_FUND_ERR', err?.response?.data || err.message);
-    response(res, false, null, 'Failed to initialize wallet funding', 500);
-  }
-});
-
-app.post('/api/wallet/transfer', authenticateToken, async (req, res) => {
-  try {
-    const { recipientEmail, amount } = req.body;
-    
-    if (!recipientEmail || !amount || amount < 100) {
-      return response(res, false, null, 'Invalid transfer parameters', 400);
-    }
-    
-    if (!isValidEmail(recipientEmail)) {
-      return response(res, false, null, 'Invalid recipient email format', 400);
-    }
-    
-    const sender = await User.findById(req.user.id);
-    if (!sender || sender.walletBalance < amount) {
-      return response(res, false, null, 'Insufficient balance', 400);
-    }
-    
-    const recipient = await User.findOne({ email: recipientEmail });
-    if (!recipient) {
-      return response(res, false, null, 'Recipient not found', 404);
-    }
-    
-    if (sender._id.toString() === recipient._id.toString()) {
-      return response(res, false, null, 'Cannot transfer to yourself', 400);
-    }
-    
-    // Create transaction record
-    const reference = generateReference('TRANSFER');
-    const transaction = new Transaction({
-      userId: sender._id,
-      type: 'transfer',
-      amount,
-      reference,
-      status: 'pending',
-      metadata: { recipientId: recipient._id, recipientEmail }
-    });
-    
-    await transaction.save();
-    
-    // Process transfer
-    sender.walletBalance -= amount;
-    recipient.walletBalance += amount;
-    
-    await Promise.all([sender.save(), recipient.save()]);
-    
-    // Update transaction status
-    transaction.status = 'successful';
-    await transaction.save();
-    
-    // Create notifications
-    await Promise.all([
-      new Notification({
-        userId: sender._id,
-        title: 'Transfer Successful',
-        message: `You transferred ₦${amount} to ${recipientEmail}`
-      }).save(),
-      new Notification({
-        userId: recipient._id,
-        title: 'Wallet Credited',
-        message: `You received ₦${amount} from ${sender.email}`
-      }).save()
-    ]);
-    
-    response(res, true, { 
-      reference,
-      newBalance: sender.walletBalance
-    }, 'Transfer successful');
-  } catch (err) {
-    console.error('TRANSFER_ERR', err);
-    response(res, false, null, 'Transfer failed', 500);
-  }
-});
-
 app.get('/api/wallet/balance', authenticateToken, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
@@ -859,7 +615,7 @@ app.get('/api/wallet/transactions', authenticateToken, async (req, res) => {
 // Service Routes
 app.post('/api/services/airtime', authenticateToken, async (req, res) => {
   try {
-    const { network, phone, amount, paymentMethod } = req.body;
+    const { network, phone, amount } = req.body;
     
     if (!network || !phone || !amount || amount < 50) {
       return response(res, false, null, 'Invalid request parameters', 400);
@@ -874,8 +630,8 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
-    // Check wallet balance if paying with wallet
-    if (paymentMethod === 'wallet' && user.walletBalance < amount) {
+    // Check wallet balance
+    if (user.walletBalance < amount) {
       return response(res, false, null, 'Insufficient wallet balance', 400);
     }
     
@@ -888,68 +644,44 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
       amount,
       reference,
       status: 'pending',
-      metadata: { network, phone, paymentMethod }
+      metadata: { network, phone }
     });
     
     await transaction.save();
     
-    // Process payment
-    if (paymentMethod === 'wallet') {
-      // Deduct from wallet
-      user.walletBalance -= amount;
+    // Deduct from wallet
+    user.walletBalance -= amount;
+    await user.save();
+    
+    // Process airtime purchase
+    const result = await processAirtimePurchase(network, phone, amount, reference);
+    
+    // Update transaction status
+    transaction.status = result.success ? 'successful' : 'failed';
+    await transaction.save();
+    
+    if (result.success) {
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'Airtime Purchase Successful',
+        message: `You purchased ₦${amount} airtime for ${phone}`
+      }).save();
+      
+      response(res, true, { reference }, 'Airtime purchase successful');
+    } else {
+      // Refund wallet if failed
+      user.walletBalance += amount;
       await user.save();
       
-      // Process airtime purchase
-      const result = await processAirtimePurchase(network, phone, amount, reference);
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'Airtime Purchase Failed',
+        message: `Your airtime purchase for ${phone} failed. Amount refunded.`
+      }).save();
       
-      // Update transaction status
-      transaction.status = result.success ? 'successful' : 'failed';
-      await transaction.save();
-      
-      if (result.success) {
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'Airtime Purchase Successful',
-          message: `You purchased ₦${amount} airtime for ${phone}`
-        }).save();
-        
-        response(res, true, { reference }, 'Airtime purchase successful');
-      } else {
-        // Refund wallet if failed
-        user.walletBalance += amount;
-        await user.save();
-        
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'Airtime Purchase Failed',
-          message: `Your airtime purchase for ${phone} failed. Amount refunded.`
-        }).save();
-        
-        response(res, false, null, result.message || 'Airtime purchase failed', 400);
-      }
-    } else {
-      // Initialize payment with Paystack
-      const initRes = await axios.post(PAYSTACK_INIT_URL, {
-        amount: amount * 100, // Convert to kobo
-        email: user.email,
-        metadata: {
-          userId: user._id,
-          serviceType: 'airtime',
-          reference,
-          network,
-          phone
-        },
-        callback_url: `${APP_BASE_URL}/payment-success.html`
-      }, {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
-      });
-      
-      response(res, true, {
-        authorization_url: initRes?.data?.data?.authorization_url,
-        reference
-      }, 'Airtime purchase initiated');
+      response(res, false, null, result.message || 'Airtime purchase failed', 400);
     }
   } catch (err) {
     console.error('AIRTIME_ERR', err);
@@ -959,7 +691,7 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
 
 app.post('/api/services/data', authenticateToken, async (req, res) => {
   try {
-    const { network, phone, plan, paymentMethod } = req.body;
+    const { network, phone, plan } = req.body;
     
     if (!network || !phone || !plan) {
       return response(res, false, null, 'Invalid request parameters', 400);
@@ -987,8 +719,8 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
       return response(res, false, null, 'Invalid plan selected', 400);
     }
     
-    // Check wallet balance if paying with wallet
-    if (paymentMethod === 'wallet' && user.walletBalance < amount) {
+    // Check wallet balance
+    if (user.walletBalance < amount) {
       return response(res, false, null, 'Insufficient wallet balance', 400);
     }
     
@@ -1001,69 +733,44 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
       amount,
       reference,
       status: 'pending',
-      metadata: { network, phone, plan, paymentMethod }
+      metadata: { network, phone, plan }
     });
     
     await transaction.save();
     
-    // Process payment
-    if (paymentMethod === 'wallet') {
-      // Deduct from wallet
-      user.walletBalance -= amount;
+    // Deduct from wallet
+    user.walletBalance -= amount;
+    await user.save();
+    
+    // Process data purchase
+    const result = await processDataPurchase(network, phone, plan, reference);
+    
+    // Update transaction status
+    transaction.status = result.success ? 'successful' : 'failed';
+    await transaction.save();
+    
+    if (result.success) {
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'Data Purchase Successful',
+        message: `You purchased ${plan} data for ${phone}`
+      }).save();
+      
+      response(res, true, { reference }, 'Data purchase successful');
+    } else {
+      // Refund wallet if failed
+      user.walletBalance += amount;
       await user.save();
       
-      // Process data purchase
-      const result = await processDataPurchase(network, phone, plan, reference);
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'Data Purchase Failed',
+        message: `Your data purchase for ${phone} failed. Amount refunded.`
+      }).save();
       
-      // Update transaction status
-      transaction.status = result.success ? 'successful' : 'failed';
-      await transaction.save();
-      
-      if (result.success) {
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'Data Purchase Successful',
-          message: `You purchased ${plan} data for ${phone}`
-        }).save();
-        
-        response(res, true, { reference }, 'Data purchase successful');
-      } else {
-        // Refund wallet if failed
-        user.walletBalance += amount;
-        await user.save();
-        
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'Data Purchase Failed',
-          message: `Your data purchase for ${phone} failed. Amount refunded.`
-        }).save();
-        
-        response(res, false, null, result.message || 'Data purchase failed', 400);
-      }
-    } else {
-      // Initialize payment with Paystack
-      const initRes = await axios.post(PAYSTACK_INIT_URL, {
-        amount: amount * 100, // Convert to kobo
-        email: user.email,
-        metadata: {
-          userId: user._id,
-          serviceType: 'data',
-          reference,
-          network,
-          phone,
-          plan
-        },
-        callback_url: `${APP_BASE_URL}/payment-success.html`
-      }, {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
-      });
-      
-      response(res, true, {
-        authorization_url: initRes?.data?.data?.authorization_url,
-        reference
-      }, 'Data purchase initiated');
+      response(res, false, null, result.message || 'Data purchase failed', 400);
     }
   } catch (err) {
     console.error('DATA_ERR', err);
@@ -1073,7 +780,7 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
 
 app.post('/api/services/electricity', authenticateToken, async (req, res) => {
   try {
-    const { disco, meter, meterType, amount, phone, email, paymentMethod } = req.body;
+    const { disco, meter, meterType, amount, phone, email } = req.body;
     
     if (!disco || !meter || !meterType || !amount || amount < 1000) {
       return response(res, false, null, 'Invalid request parameters', 400);
@@ -1092,8 +799,8 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
-    // Check wallet balance if paying with wallet
-    if (paymentMethod === 'wallet' && user.walletBalance < amount) {
+    // Check wallet balance
+    if (user.walletBalance < amount) {
       return response(res, false, null, 'Insufficient wallet balance', 400);
     }
     
@@ -1106,90 +813,63 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
       amount,
       reference,
       status: 'pending',
-      metadata: { disco, meter, meterType, phone, email, paymentMethod }
+      metadata: { disco, meter, meterType, phone, email }
     });
     
     await transaction.save();
     
-    // Process payment
-    if (paymentMethod === 'wallet') {
-      // Deduct from wallet
-      user.walletBalance -= amount;
+    // Deduct from wallet
+    user.walletBalance -= amount;
+    await user.save();
+    
+    // Process electricity payment
+    const result = await processElectricityPayment(disco, meter, meterType, amount, reference);
+    
+    // Update transaction status
+    transaction.status = result.success ? 'successful' : 'failed';
+    transaction.metadata.token = result.token;
+    await transaction.save();
+    
+    if (result.success) {
+      // Send token via email and SMS
+      if (email) {
+        await sendEmail(
+          email,
+          'Electricity Token',
+          `<h1>Your Electricity Token</h1>
+          <p>Token: <strong>${result.token}</strong></p>
+          <p>Amount: ₦${amount}</p>
+          <p>Reference: ${reference}</p>`
+        );
+      }
+      
+      // Send SMS (in a real app, you would integrate with an SMS service)
+      console.log(`SMS sent to ${phone}: Your electricity token is ${result.token}`);
+      
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'Electricity Payment Successful',
+        message: `Your electricity payment of ₦${amount} was successful. Token: ${result.token}`
+      }).save();
+      
+      response(res, true, { 
+        reference,
+        token: result.token 
+      }, 'Electricity payment successful');
+    } else {
+      // Refund wallet if failed
+      user.walletBalance += amount;
       await user.save();
       
-      // Process electricity payment
-      const result = await processElectricityPayment(disco, meter, meterType, amount, reference);
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'Electricity Payment Failed',
+        message: `Your electricity payment failed. Amount refunded.`
+      }).save();
       
-      // Update transaction status
-      transaction.status = result.success ? 'successful' : 'failed';
-      transaction.metadata.token = result.token;
-      await transaction.save();
-      
-      if (result.success) {
-        // Send token via email and SMS
-        if (email) {
-          await sendEmail(
-            email,
-            'Electricity Token',
-            `<h1>Your Electricity Token</h1>
-            <p>Token: <strong>${result.token}</strong></p>
-            <p>Amount: ₦${amount}</p>
-            <p>Reference: ${reference}</p>`
-          );
-        }
-        
-        // Send SMS (in a real app, you would integrate with an SMS service)
-        console.log(`SMS sent to ${phone}: Your electricity token is ${result.token}`);
-        
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'Electricity Payment Successful',
-          message: `Your electricity payment of ₦${amount} was successful. Token: ${result.token}`
-        }).save();
-        
-        response(res, true, { 
-          reference,
-          token: result.token 
-        }, 'Electricity payment successful');
-      } else {
-        // Refund wallet if failed
-        user.walletBalance += amount;
-        await user.save();
-        
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'Electricity Payment Failed',
-          message: `Your electricity payment failed. Amount refunded.`
-        }).save();
-        
-        response(res, false, null, result.message || 'Electricity payment failed', 400);
-      }
-    } else {
-      // Initialize payment with Paystack
-      const initRes = await axios.post(PAYSTACK_INIT_URL, {
-        amount: amount * 100, // Convert to kobo
-        email: user.email,
-        metadata: {
-          userId: user._id,
-          serviceType: 'electricity',
-          reference,
-          disco,
-          meter,
-          meterType,
-          phone,
-          email
-        },
-        callback_url: `${APP_BASE_URL}/payment-success.html`
-      }, {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
-      });
-      
-      response(res, true, {
-        authorization_url: initRes?.data?.data?.authorization_url,
-        reference
-      }, 'Electricity payment initiated');
+      response(res, false, null, result.message || 'Electricity payment failed', 400);
     }
   } catch (err) {
     console.error('ELECTRICITY_ERR', err);
@@ -1199,7 +879,7 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
 
 app.post('/api/services/tv', authenticateToken, async (req, res) => {
   try {
-    const { provider, smartcard, plan, phone, email, paymentMethod } = req.body;
+    const { provider, smartcard, plan, phone, email } = req.body;
     
     if (!provider || !smartcard || !plan) {
       return response(res, false, null, 'Invalid request parameters', 400);
@@ -1237,8 +917,8 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
       return response(res, false, null, 'Invalid plan selected', 400);
     }
     
-    // Check wallet balance if paying with wallet
-    if (paymentMethod === 'wallet' && user.walletBalance < amount) {
+    // Check wallet balance
+    if (user.walletBalance < amount) {
       return response(res, false, null, 'Insufficient wallet balance', 400);
     }
     
@@ -1251,90 +931,63 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
       amount,
       reference,
       status: 'pending',
-      metadata: { provider, smartcard, plan, phone, email, paymentMethod }
+      metadata: { provider, smartcard, plan, phone, email }
     });
     
     await transaction.save();
     
-    // Process payment
-    if (paymentMethod === 'wallet') {
-      // Deduct from wallet
-      user.walletBalance -= amount;
+    // Deduct from wallet
+    user.walletBalance -= amount;
+    await user.save();
+    
+    // Process TV subscription
+    const result = await processTVSubscription(provider, smartcard, plan, reference);
+    
+    // Update transaction status
+    transaction.status = result.success ? 'successful' : 'failed';
+    await transaction.save();
+    
+    if (result.success) {
+      // Send confirmation via email and SMS
+      if (email) {
+        await sendEmail(
+          email,
+          'TV Subscription Confirmation',
+          `<h1>TV Subscription Successful</h1>
+          <p>Provider: ${provider}</p>
+          <p>Smartcard: ${smartcard}</p>
+          <p>Plan: ${plan}</p>
+          <p>Amount: ₦${amount}</p>
+          <p>Reference: ${reference}</p>`
+        );
+      }
+      
+      // Send SMS (in a real app, you would integrate with an SMS service)
+      console.log(`SMS sent to ${phone}: Your TV subscription for ${provider} has been renewed`);
+      
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'TV Subscription Successful',
+        message: `Your ${provider} subscription has been renewed successfully.`
+      }).save();
+      
+      response(res, true, { 
+        reference 
+      }, 'TV subscription successful');
+    } else {
+      // Refund wallet if failed
+      user.walletBalance += amount;
       await user.save();
       
-      // Process TV subscription
-      const result = await processTVSubscription(provider, smartcard, plan, reference);
+      // Create notification
+      await new Notification({
+        userId: user._id,
+        title: 'TV Subscription Failed',
+        message: `Your TV subscription failed. Amount refunded.`
+      }).save();
       
-      // Update transaction status
-      transaction.status = result.success ? 'successful' : 'failed';
-      await transaction.save();
-      
-      if (result.success) {
-        // Send confirmation via email and SMS
-        if (email) {
-          await sendEmail(
-            email,
-            'TV Subscription Confirmation',
-            `<h1>TV Subscription Successful</h1>
-            <p>Provider: ${provider}</p>
-            <p>Smartcard: ${smartcard}</p>
-            <p>Plan: ${plan}</p>
-            <p>Amount: ₦${amount}</p>
-            <p>Reference: ${reference}</p>`
-          );
-        }
-        
-        // Send SMS (in a real app, you would integrate with an SMS service)
-        console.log(`SMS sent to ${phone}: Your TV subscription for ${provider} has been renewed`);
-        
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'TV Subscription Successful',
-          message: `Your ${provider} subscription has been renewed successfully.`
-        }).save();
-        
-        response(res, true, { 
-          reference 
-        }, 'TV subscription successful');
-      } else {
-        // Refund wallet if failed
-        user.walletBalance += amount;
-        await user.save();
-        
-        // Create notification
-        await new Notification({
-          userId: user._id,
-          title: 'TV Subscription Failed',
-          message: `Your TV subscription failed. Amount refunded.`
-        }).save();
-        
-        response(res, false, null, result.message || 'TV subscription failed', 400);
-      }
-    } else {
-      // Initialize payment with Paystack
-      const initRes = await axios.post(PAYSTACK_INIT_URL, {
-        amount: amount * 100, // Convert to kobo
-        email: user.email,
-        metadata: {
-          userId: user._id,
-          serviceType: 'tv',
-          reference,
-          provider,
-          smartcard,
-          plan,
-          phone,
-          email
-        },
-        callback_url: `${APP_BASE_URL}/payment-success.html`
-      }, {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
-      });
-      
-      response(res, true, {
-        authorization_url: initRes?.data?.data?.authorization_url,
-        reference
-      }, 'TV subscription initiated');
+      response(res, false, null, result.message || 'TV subscription failed', 400);
     }
   } catch (err) {
     console.error('TV_ERR', err);
@@ -1727,8 +1380,14 @@ app.get('/health', (req, res) => {
   response(res, true, { status: 'ok', time: new Date().toISOString() }, 'Health check');
 });
 
-// Start server
+// Start server - UPDATED FOR PRODUCTION
 app.listen(PORT, () => {
   console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
-  console.log(`CORS configured for: ${allowedOrigins.join(', ')}`);
+  console.log(`CORS configured for: ${uniqueOrigins.join(', ')}`);
+  
+  // Log production URL
+  if (process.env.NODE_ENV === 'production') {
+    console.log(`Backend live at: https://easy-subscribe-backend.onrender.com`);
+    console.log(`Frontend URL should be set to: ${APP_BASE_URL}`);
+  }
 });
