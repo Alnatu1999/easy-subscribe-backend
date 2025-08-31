@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const { connectDB, User, Transaction, AdminRole, Notification, Commission } = require('./db.js');
+const vtuService = require('./services/vtuService'); // Import VTU service
 dotenv.config();
 const app = express();
 app.use(helmet());
@@ -584,6 +585,98 @@ app.get('/api/wallet/transactions', authenticateToken, async (req, res) => {
     response(res, false, null, 'Failed to get wallet transactions', 500);
   }
 });
+// User Funding Request Endpoint
+app.post('/api/user/fund-request', authenticateToken, async (req, res) => {
+  try {
+    const { amount, paymentMethod, reference } = req.body;
+    
+    // Validate input
+    if (!amount || amount <= 0) {
+      return response(res, false, null, 'Invalid amount', 400);
+    }
+    
+    if (!paymentMethod || !['bank_transfer', 'cash', 'other'].includes(paymentMethod)) {
+      return response(res, false, null, 'Invalid payment method', 400);
+    }
+    
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return response(res, false, null, 'User not found', 404);
+    }
+    
+    // Create funding request
+    const transaction = new Transaction({
+      userId: user._id,
+      type: 'funding',
+      amount,
+      reference: reference || generateReference('FUND'),
+      status: 'pending',
+      metadata: { 
+        paymentMethod,
+        requestedBy: user._id,
+        requestDate: new Date()
+      }
+    });
+    
+    await transaction.save();
+    
+    // Create notification for user
+    await new Notification({
+      userId: user._id,
+      title: 'Funding Request Submitted',
+      message: `Your funding request of ₦${amount} has been submitted and is pending approval.`
+    }).save();
+    
+    // Create notification for admins
+    const adminUsers = await User.find({ role: { $in: ['admin', 'super-admin'] } });
+    for (const admin of adminUsers) {
+      await new Notification({
+        userId: admin._id,
+        title: 'New Funding Request',
+        message: `User ${user.name} requested ₦${amount} funding.`
+      }).save();
+    }
+    
+    response(res, true, { 
+      transactionId: transaction._id,
+      reference: transaction.reference 
+    }, 'Funding request submitted successfully');
+  } catch (err) {
+    console.error('FUND_REQUEST_ERR', err);
+    response(res, false, null, 'Failed to submit funding request', 500);
+  }
+});
+
+// Get User Funding Requests
+app.get('/api/user/fund-requests', authenticateToken, async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status } = req.query;
+    const skip = (page - 1) * limit;
+    
+    let filter = { userId: req.user.id, type: 'funding' };
+    if (status) filter.status = status;
+    
+    const transactions = await Transaction.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+    
+    const total = await Transaction.countDocuments(filter);
+    
+    response(res, true, {
+      transactions,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / limit)
+      }
+    }, 'Funding requests retrieved');
+  } catch (err) {
+    console.error('GET_USER_FUND_REQUESTS_ERR', err);
+    response(res, false, null, 'Failed to get funding requests', 500);
+  }
+});
 // Service Routes
 app.post('/api/services/airtime', authenticateToken, async (req, res) => {
   try {
@@ -846,6 +939,24 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
     response(res, false, null, 'Electricity payment failed', 500);
   }
 });
+// NEW: Get TV variations endpoint
+app.get('/api/services/tv-variations', async (req, res) => {
+  try {
+    const { provider } = req.query;
+    
+    const result = await vtuService.getTvVariations(provider);
+    
+    if (result.code === 'success') {
+      response(res, true, result.data, 'TV variations retrieved');
+    } else {
+      response(res, false, null, result.message || 'Failed to fetch TV variations', 500);
+    }
+  } catch (err) {
+    console.error('TV_VARIATIONS_ERR', err);
+    response(res, false, null, 'Failed to fetch TV variations', 500);
+  }
+});
+// UPDATED: TV subscription endpoint with VTU.ng integration
 app.post('/api/services/tv', authenticateToken, async (req, res) => {
   try {
     const { provider, smartcard, plan, phone, email } = req.body;
@@ -867,24 +978,23 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
-    // Get plan amount (in a real app, this would come from a database)
-    const planAmounts = {
-      'dstv1': 24000,
-      'dstv2': 15700,
-      'dstv3': 10500,
-      'dstv4': 6800,
-      'gotv1': 5500,
-      'gotv2': 3280,
-      'gotv3': 2460,
-      'startimes1': 4200,
-      'startimes2': 2600,
-      'startimes3': 1900
-    };
+    // Get plan amount from VTU variations
+    const variationsResult = await vtuService.getTvVariations(provider);
     
-    const amount = planAmounts[plan];
-    if (!amount) {
+    if (variationsResult.code !== 'success') {
+      return response(res, false, null, 'Failed to fetch TV plans', 500);
+    }
+    
+    // Find the selected plan
+    const selectedPlan = variationsResult.data.find(
+      item => item.variation_id === plan || item.package_bouquet.toLowerCase().includes(plan.toLowerCase())
+    );
+    
+    if (!selectedPlan) {
       return response(res, false, null, 'Invalid plan selected', 400);
     }
+    
+    const amount = parseFloat(selectedPlan.price);
     
     // Check wallet balance
     if (user.walletBalance < amount) {
@@ -925,7 +1035,7 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
           `<h1>TV Subscription Successful</h1>
           <p>Provider: ${provider}</p>
           <p>Smartcard: ${smartcard}</p>
-          <p>Plan: ${plan}</p>
+          <p>Plan: ${selectedPlan.package_bouquet}</p>
           <p>Amount: ₦${amount}</p>
           <p>Reference: ${reference}</p>`
         );
@@ -1268,6 +1378,199 @@ app.post('/api/admin/notifications', authenticateToken, authorizeRole(['admin', 
     response(res, false, null, 'Failed to send notification', 500);
   }
 });
+// Admin Manual Funding Endpoint
+app.post('/api/admin/fund-wallet', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
+  try {
+    const { userId, amount, note } = req.body;
+    
+    // Validate input
+    if (!userId) {
+      return response(res, false, null, 'User ID is required', 400);
+    }
+    
+    if (!amount || amount <= 0) {
+      return response(res, false, null, 'Invalid amount', 400);
+    }
+    
+    // Find user
+    const user = await User.findById(userId);
+    if (!user) {
+      return response(res, false, null, 'User not found', 404);
+    }
+    
+    // Create transaction
+    const transaction = new Transaction({
+      userId: user._id,
+      type: 'funding',
+      amount,
+      reference: generateReference('ADMIN_FUND'),
+      status: 'successful',
+      metadata: { 
+        fundedBy: req.user.id,
+        note,
+        fundingDate: new Date()
+      }
+    });
+    
+    await transaction.save();
+    
+    // Update user wallet
+    user.walletBalance += amount;
+    await user.save();
+    
+    // Create notification for user
+    await new Notification({
+      userId: user._id,
+      title: 'Wallet Funded',
+      message: `Your wallet has been funded with ₦${amount} by admin.`
+    }).save();
+    
+    response(res, true, { 
+      transactionId: transaction._id,
+      reference: transaction.reference,
+      newBalance: user.walletBalance
+    }, 'Wallet funded successfully');
+  } catch (err) {
+    console.error('ADMIN_FUND_WALLET_ERR', err);
+    response(res, false, null, 'Failed to fund wallet', 500);
+  }
+});
+
+// Admin Approve Funding Request Endpoint
+app.put('/api/admin/fund-request/:id/approve', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
+  try {
+    const { note } = req.body;
+    
+    // Find transaction
+    const transaction = await Transaction.findById(req.params.id);
+    if (!transaction) {
+      return response(res, false, null, 'Transaction not found', 404);
+    }
+    
+    // Verify it's a funding request
+    if (transaction.type !== 'funding') {
+      return response(res, false, null, 'Not a funding transaction', 400);
+    }
+    
+    // Verify it's pending
+    if (transaction.status !== 'pending') {
+      return response(res, false, null, 'Transaction already processed', 400);
+    }
+    
+    // Find user
+    const user = await User.findById(transaction.userId);
+    if (!user) {
+      return response(res, false, null, 'User not found', 404);
+    }
+    
+    // Update transaction
+    transaction.status = 'successful';
+    transaction.metadata.approvedBy = req.user.id;
+    transaction.metadata.approvalDate = new Date();
+    transaction.metadata.note = note;
+    await transaction.save();
+    
+    // Update user wallet
+    user.walletBalance += transaction.amount;
+    await user.save();
+    
+    // Create notification for user
+    await new Notification({
+      userId: user._id,
+      title: 'Funding Request Approved',
+      message: `Your funding request of ₦${transaction.amount} has been approved.`
+    }).save();
+    
+    response(res, true, { 
+      transactionId: transaction._id,
+      reference: transaction.reference,
+      newBalance: user.walletBalance
+    }, 'Funding request approved successfully');
+  } catch (err) {
+    console.error('APPROVE_FUND_REQUEST_ERR', err);
+    response(res, false, null, 'Failed to approve funding request', 500);
+  }
+});
+
+// Admin Reject Funding Request Endpoint
+app.put('/api/admin/fund-request/:id/reject', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    
+    // Find transaction
+    const transaction = await Transaction.findById(req.params.id);
+    if (!transaction) {
+      return response(res, false, null, 'Transaction not found', 404);
+    }
+    
+    // Verify it's a funding request
+    if (transaction.type !== 'funding') {
+      return response(res, false, null, 'Not a funding transaction', 400);
+    }
+    
+    // Verify it's pending
+    if (transaction.status !== 'pending') {
+      return response(res, false, null, 'Transaction already processed', 400);
+    }
+    
+    // Update transaction
+    transaction.status = 'failed';
+    transaction.metadata.rejectedBy = req.user.id;
+    transaction.metadata.rejectionDate = new Date();
+    transaction.metadata.rejectionReason = reason;
+    await transaction.save();
+    
+    // Create notification for user
+    await new Notification({
+      userId: transaction.userId,
+      title: 'Funding Request Rejected',
+      message: `Your funding request of ₦${transaction.amount} was rejected. Reason: ${reason || 'Not specified'}`
+    }).save();
+    
+    response(res, true, { 
+      transactionId: transaction._id,
+      reference: transaction.reference
+    }, 'Funding request rejected');
+  } catch (err) {
+    console.error('REJECT_FUND_REQUEST_ERR', err);
+    response(res, false, null, 'Failed to reject funding request', 500);
+  }
+});
+
+// Get Funding Requests (Admin)
+app.get('/api/admin/fund-requests', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status } = req.query;
+    const skip = (page - 1) * limit;
+    
+    let filter = { type: 'funding' };
+    if (status) filter.status = status;
+    
+    const transactions = await Transaction.find(filter)
+      .populate('userId', 'name email')
+      .populate('metadata.fundedBy', 'name')
+      .populate('metadata.approvedBy', 'name')
+      .populate('metadata.rejectedBy', 'name')
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+    
+    const total = await Transaction.countDocuments(filter);
+    
+    response(res, true, {
+      transactions,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / limit)
+      }
+    }, 'Funding requests retrieved');
+  } catch (err) {
+    console.error('GET_FUND_REQUESTS_ERR', err);
+    response(res, false, null, 'Failed to get funding requests', 500);
+  }
+});
 // Service Processing Functions (Simplified for demo)
 async function processAirtimePurchase(network, phone, amount, reference) {
   // In a real app, this would integrate with a VTpass or similar API
@@ -1313,20 +1616,134 @@ async function processElectricityPayment(disco, meter, meterType, amount, refere
     return { success: false, message: 'Failed to process electricity payment' };
   }
 }
+// UPDATED: TV subscription processing function with VTU.ng integration
 async function processTVSubscription(provider, smartcard, plan, reference) {
-  // In a real app, this would integrate with a VTpass or similar API
-  console.log(`Processing TV subscription: ${provider} ${smartcard} ${plan} ${reference}`);
-  
-  // Simulate API call
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  
-  // Simulate success (90% success rate)
-  if (Math.random() < 0.9) {
-    return { success: true };
-  } else {
-    return { success: false, message: 'Failed to process TV subscription' };
+  try {
+    // Step 1: Verify customer details
+    const verificationResult = await vtuService.verifyCustomer(smartcard, provider);
+    
+    if (verificationResult.code !== 'success') {
+      return { 
+        success: false, 
+        message: verificationResult.message || 'Customer verification failed' 
+      };
+    }
+    // Step 2: Get TV variations to find the variation ID for the selected plan
+    const variationsResult = await vtuService.getTvVariations(provider);
+    
+    if (variationsResult.code !== 'success') {
+      return { 
+        success: false, 
+        message: variationsResult.message || 'Failed to fetch TV plans' 
+      };
+    }
+    // Find the variation ID for the selected plan
+    const selectedPlan = variationsResult.data.find(
+      item => item.variation_id === plan || item.package_bouquet.toLowerCase().includes(plan.toLowerCase())
+    );
+    if (!selectedPlan) {
+      return { 
+        success: false, 
+        message: 'Invalid plan selected' 
+      };
+    }
+    // Step 3: Purchase the subscription
+    const purchaseResult = await vtuService.purchaseTvSubscription(
+      reference,
+      smartcard,
+      provider,
+      selectedPlan.variation_id,
+      'change' // Default to change subscription type
+    );
+    if (purchaseResult.code === 'success') {
+      // Check if the order was successful or processing
+      if (purchaseResult.data.status === 'completed-api' || purchaseResult.data.status === 'processing-api') {
+        return { 
+          success: true, 
+          message: 'TV subscription successful',
+          data: {
+            reference,
+            status: purchaseResult.data.status,
+            customerName: purchaseResult.data.customer_name,
+            amount: purchaseResult.data.amount
+          }
+        };
+      } else if (purchaseResult.data.status === 'refunded') {
+        return { 
+          success: false, 
+          message: 'TV subscription failed and refunded' 
+        };
+      } else {
+        return { 
+          success: false, 
+          message: `TV subscription processing with status: ${purchaseResult.data.status}` 
+        };
+      }
+    } else {
+      return { 
+        success: false, 
+        message: purchaseResult.message || 'TV subscription failed' 
+      };
+    }
+  } catch (error) {
+    console.error('VTU TV Subscription Error:', error);
+    return { 
+      success: false, 
+      message: error.message || 'TV subscription failed' 
+    };
   }
 }
+// Webhook endpoint for VTU.ng
+app.post('/api/webhooks/vtu', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const signature = req.headers['x-signature'];
+    const payload = JSON.parse(req.body);
+    
+    // Verify the webhook signature
+    const isValid = vtuService.verifyWebhookSignature(payload, signature);
+    
+    if (!isValid) {
+      return response(res, false, null, 'Invalid signature', 403);
+    }
+    
+    // Process the webhook
+    const { order_id, status, request_id } = payload;
+    
+    // Find the transaction by reference
+    const transaction = await Transaction.findOne({ reference: request_id });
+    
+    if (transaction) {
+      // Update transaction status
+      if (status === 'completed-api') {
+        transaction.status = 'successful';
+      } else if (status === 'refunded') {
+        transaction.status = 'failed';
+        
+        // Refund the user if not already refunded
+        const user = await User.findById(transaction.userId);
+        if (user && transaction.status !== 'refunded') {
+          user.walletBalance += transaction.amount;
+          await user.save();
+        }
+      }
+      
+      await transaction.save();
+      
+      // Create notification
+      await new Notification({
+        userId: transaction.userId,
+        title: `TV Subscription ${status === 'completed-api' ? 'Successful' : 'Failed'}`,
+        message: `Your TV subscription ${status === 'completed-api' ? 'was successful' : 'failed and was refunded'}.`
+      }).save();
+    }
+    
+    // Respond to VTU.ng
+    res.status(200).json({ status: 'success' });
+  } catch (error) {
+    console.error('VTU Webhook Error:', error);
+    res.status(500).json({ status: 'error' });
+  }
+});
 // Health check
 app.get('/health', (req, res) => {
   response(res, true, { status: 'ok', time: new Date().toISOString() }, 'Health check');

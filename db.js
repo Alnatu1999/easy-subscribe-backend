@@ -34,23 +34,38 @@ userSchema.index({ email: 1 });
 userSchema.index({ role: 1 });
 userSchema.index({ createdAt: -1 });
 
-// Transaction Schema
+// Transaction Schema - UPDATED to include 'funding' type
 const transactionSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  type: { type: String, enum: ['airtime', 'data', 'electricity', 'tv', 'wallet-funding', 'transfer'], required: true },
+  type: { 
+    type: String, 
+    enum: ['airtime', 'data', 'electricity', 'tv', 'funding'], 
+    required: true 
+  },
   amount: { type: Number, required: true },
   status: { type: String, enum: ['pending', 'successful', 'failed'], default: 'pending' },
   reference: { type: String, unique: true },
-  metadata: { type: Object },
+  metadata: { 
+    type: Object,
+    default: {}
+  },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
+// Indexes for Transaction Schema
 transactionSchema.index({ userId: 1 });
 transactionSchema.index({ reference: 1 });
 transactionSchema.index({ status: 1 });
 transactionSchema.index({ type: 1 });
 transactionSchema.index({ createdAt: -1 });
+// Additional indexes for funding-related queries
+transactionSchema.index({ type: 1, status: 1 });
+transactionSchema.index({ 'metadata.paymentMethod': 1 });
+transactionSchema.index({ 'metadata.requestedBy': 1 });
+transactionSchema.index({ 'metadata.fundedBy': 1 });
+transactionSchema.index({ 'metadata.approvedBy': 1 });
+transactionSchema.index({ 'metadata.rejectedBy': 1 });
 
 // Admin Role Schema
 const adminRoleSchema = new mongoose.Schema({
