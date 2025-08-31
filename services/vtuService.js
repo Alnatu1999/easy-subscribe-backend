@@ -22,13 +22,11 @@ async function getAccessToken() {
   if (accessToken && tokenExpiry && new Date() < tokenExpiry) {
     return accessToken;
   }
-
   try {
     const response = await axios.post(VTU_AUTH_URL, {
       username: VTU_USERNAME,
       password: VTU_PASSWORD
     });
-
     if (response.data.token) {
       accessToken = response.data.token;
       // Token expires after 7 days, set expiry to 6 days for safety
@@ -43,6 +41,42 @@ async function getAccessToken() {
   }
 }
 
+// Validate smartcard format based on provider
+function validateSmartcardFormat(smartcard, provider) {
+  if (!smartcard || typeof smartcard !== 'string') {
+    return { valid: false, message: 'Smartcard number is required' };
+  }
+  
+  // Remove any spaces or dashes
+  const cleanCard = smartcard.replace(/[\s-]/g, '');
+  
+  // Provider-specific validation
+  switch (provider.toLowerCase()) {
+    case 'dstv':
+      if (!/^\d{10,11}$/.test(cleanCard)) {
+        return { valid: false, message: 'DStv smartcard must be 10-11 digits' };
+      }
+      break;
+    case 'gotv':
+      if (!/^\d{10}$/.test(cleanCard)) {
+        return { valid: false, message: 'GOtv smartcard must be 10 digits' };
+      }
+      break;
+    case 'startimes':
+      if (!/^\d{10,12}$/.test(cleanCard)) {
+        return { valid: false, message: 'StarTimes smartcard must be 10-12 digits' };
+      }
+      break;
+    default:
+      // Generic validation for unknown providers
+      if (!/^\d{8,15}$/.test(cleanCard)) {
+        return { valid: false, message: 'Invalid smartcard number format' };
+      }
+  }
+  
+  return { valid: true, message: 'Valid format' };
+}
+
 // Get TV variations (public endpoint, no auth required)
 async function getTvVariations(serviceId = null) {
   try {
@@ -50,7 +84,6 @@ async function getTvVariations(serviceId = null) {
     if (serviceId) {
       url += `?service_id=${serviceId}`;
     }
-
     const response = await axios.get(url);
     return response.data;
   } catch (error) {
@@ -61,6 +94,15 @@ async function getTvVariations(serviceId = null) {
 
 // Verify customer (smartcard/IUC number)
 async function verifyCustomer(customerId, serviceId) {
+  // First, validate the format locally
+  const formatValidation = validateSmartcardFormat(customerId, serviceId);
+  if (!formatValidation.valid) {
+    return {
+      code: 'error',
+      message: formatValidation.message
+    };
+  }
+  
   try {
     const token = await getAccessToken();
     
@@ -77,17 +119,51 @@ async function verifyCustomer(customerId, serviceId) {
         }
       }
     );
-
     return response.data;
   } catch (error) {
     console.error('Error verifying customer:', error.response?.data || error.message);
-    throw new Error('Failed to verify customer details');
+    
+    // Provide more specific error messages based on the error
+    if (error.response && error.response.data) {
+      const vtuError = error.response.data;
+      
+      if (vtuError.message && vtuError.message.toLowerCase().includes('invalid')) {
+        return {
+          code: 'error',
+          message: 'Invalid smartcard number'
+        };
+      } else if (vtuError.message && vtuError.message.toLowerCase().includes('not found')) {
+        return {
+          code: 'error',
+          message: 'Smartcard not found'
+        };
+      } else if (vtuError.message && vtuError.message.toLowerCase().includes('does not exist')) {
+        return {
+          code: 'error',
+          message: 'Smartcard does not exist'
+        };
+      }
+    }
+    
+    return {
+      code: 'error',
+      message: 'Failed to verify customer details'
+    };
   }
 }
 
 // Purchase TV subscription
 async function purchaseTvSubscription(requestId, customerId, serviceId, variationId, subscriptionType = 'change') {
   try {
+    // Validate smartcard format before making the purchase
+    const formatValidation = validateSmartcardFormat(customerId, serviceId);
+    if (!formatValidation.valid) {
+      return {
+        code: 'error',
+        message: formatValidation.message
+      };
+    }
+    
     const token = await getAccessToken();
     
     const response = await axios.post(
@@ -106,11 +182,31 @@ async function purchaseTvSubscription(requestId, customerId, serviceId, variatio
         }
       }
     );
-
     return response.data;
   } catch (error) {
     console.error('Error purchasing TV subscription:', error.response?.data || error.message);
-    throw new Error('Failed to purchase TV subscription');
+    
+    // Provide more specific error messages based on the error
+    if (error.response && error.response.data) {
+      const vtuError = error.response.data;
+      
+      if (vtuError.message && vtuError.message.toLowerCase().includes('invalid customer')) {
+        return {
+          code: 'error',
+          message: 'Invalid smartcard number'
+        };
+      } else if (vtuError.message && vtuError.message.toLowerCase().includes('insufficient balance')) {
+        return {
+          code: 'error',
+          message: 'Insufficient balance for this subscription'
+        };
+      }
+    }
+    
+    return {
+      code: 'error',
+      message: 'Failed to purchase TV subscription'
+    };
   }
 }
 
@@ -131,7 +227,6 @@ async function requeryOrder(requestId) {
         }
       }
     );
-
     return response.data;
   } catch (error) {
     console.error('Error requerying order:', error.response?.data || error.message);
@@ -158,5 +253,6 @@ module.exports = {
   verifyCustomer,
   purchaseTvSubscription,
   requeryOrder,
-  verifyWebhookSignature
+  verifyWebhookSignature,
+  validateSmartcardFormat  // Export the validation function for use in other modules
 };
