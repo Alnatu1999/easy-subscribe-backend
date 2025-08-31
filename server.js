@@ -10,6 +10,8 @@ const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const { connectDB, User, Transaction, AdminRole, Notification, Commission } = require('./db.js');
 const vtuService = require('./services/vtuService'); // Import VTU service
+const tvRoutes = require('./routes/tvRoutes');
+
 dotenv.config();
 const app = express();
 app.use(helmet());
@@ -50,6 +52,7 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+app.use('/api/services', tvRoutes);
 app.use('/api/auth/', authLimiter);
 // Connect to Database
 connectDB();
