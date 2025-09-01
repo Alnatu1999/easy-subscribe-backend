@@ -1,4 +1,4 @@
-// server.js - Modified version without node-cache dependency
+// server.js - Complete implementation with missing logic
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -10,8 +10,8 @@ const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const { connectDB, User, Transaction, AdminRole, Notification, Commission } = require('./db.js');
-
 dotenv.config();
+
 const app = express();
 app.use(helmet());
 
@@ -50,8 +50,11 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Connect to Database
-connectDB();
+// Connect to Database with error handling
+connectDB().catch(err => {
+  console.error('Database connection failed:', err);
+  process.exit(1);
+});
 
 // Constants
 const PORT = process.env.PORT || 5001;
@@ -60,6 +63,7 @@ const APP_BASE_URL = process.env.APP_BASE_URL || (process.env.NODE_ENV === 'prod
   : 'http://localhost:5173');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'your-refresh-secret';
+const COMMISSION_RATE = parseFloat(process.env.COMMISSION_RATE) || 0.02; // 2% default commission
 
 // VTU.ng API configuration
 const VTU_BASE_URL = 'https://vtu.ng/wp-json';
@@ -71,10 +75,11 @@ const VTU_USERNAME = process.env.VTU_USERNAME || 'your_vtu_username';
 const VTU_PASSWORD = process.env.VTU_PASSWORD || 'your_vtu_password';
 const VTU_USER_PIN = process.env.VTU_USER_PIN || 'your_user_pin';
 
-// Cache for access token and TV variations (simple in-memory cache)
+// Cache for access token and variations (simple in-memory cache)
 let accessToken = null;
 let tokenExpiry = null;
 let tvVariationsCache = {};
+let dataVariationsCache = {};
 const CACHE_TTL = 3600000; // 1 hour in milliseconds
 
 // Middleware
@@ -176,6 +181,31 @@ function generateTokens(user) {
   return { accessToken, refreshToken };
 }
 
+// Calculate commission
+function calculateCommission(amount) {
+  return amount * COMMISSION_RATE;
+}
+
+// Create commission record
+async function createCommission(userId, transactionId, amount) {
+  try {
+    const commissionAmount = calculateCommission(amount);
+    
+    const commission = new Commission({
+      userId,
+      transactionId,
+      amount: commissionAmount,
+      status: 'pending'
+    });
+    
+    await commission.save();
+    return commission;
+  } catch (error) {
+    console.error('COMMISSION_CREATE_ERR', error);
+    return null;
+  }
+}
+
 // VTU Service Functions
 // Get access token from VTU.ng
 async function getAccessToken() {
@@ -238,7 +268,7 @@ function validateSmartcardFormat(smartcard, provider) {
   return { valid: true, message: 'Valid format' };
 }
 
-// Get TV variations (public endpoint, no auth required) - UPDATED WITH SIMPLE CACHE
+// Get TV variations (public endpoint, no auth required)
 async function getTvVariations(serviceId = null) {
   // Check cache first
   const cacheKey = serviceId || 'all';
@@ -267,6 +297,38 @@ async function getTvVariations(serviceId = null) {
   } catch (error) {
     console.error('Error fetching TV variations:', error.response?.data || error.message);
     throw new Error('Failed to fetch TV variations');
+  }
+}
+
+// Get data variations (public endpoint, no auth required)
+async function getDataVariations(networkId = null) {
+  // Check cache first
+  const cacheKey = networkId || 'all';
+  const cachedData = dataVariationsCache[cacheKey];
+  
+  if (cachedData && (Date.now() - cachedData.timestamp) < CACHE_TTL) {
+    console.log(`Returning cached data variations for: ${cacheKey}`);
+    return cachedData.data;
+  }
+  
+  try {
+    let url = `${VTU_API_URL}/variations/data`;
+    if (networkId) {
+      url += `?network_id=${networkId}`;
+    }
+    const response = await axios.get(url);
+    
+    // Cache the response
+    dataVariationsCache[cacheKey] = {
+      data: response.data,
+      timestamp: Date.now()
+    };
+    console.log(`Cached data variations for: ${cacheKey}`);
+    
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching data variations:', error.response?.data || error.message);
+    throw new Error('Failed to fetch data variations');
   }
 }
 
@@ -388,6 +450,146 @@ async function purchaseTvSubscription(requestId, customerId, serviceId, variatio
   }
 }
 
+// Process airtime purchase
+async function processAirtimePurchase(network, phone, amount, reference) {
+  try {
+    const token = await getAccessToken();
+    
+    const response = await axios.post(
+      `${VTU_API_URL}/airtime`,
+      {
+        request_id: reference,
+        phone,
+        network_id: network,
+        amount
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    return {
+      success: response.data.code === 'success',
+      message: response.data.message || 'Airtime purchase processed'
+    };
+  } catch (error) {
+    console.error('Error processing airtime purchase:', error.response?.data || error.message);
+    
+    if (error.response && error.response.data) {
+      const vtuError = error.response.data;
+      
+      if (vtuError.message && vtuError.message.toLowerCase().includes('insufficient balance')) {
+        return {
+          success: false,
+          message: 'Insufficient balance for airtime purchase'
+        };
+      }
+    }
+    
+    return {
+      success: false,
+      message: 'Failed to process airtime purchase'
+    };
+  }
+}
+
+// Process data purchase
+async function processDataPurchase(network, phone, plan, reference) {
+  try {
+    const token = await getAccessToken();
+    
+    const response = await axios.post(
+      `${VTU_API_URL}/data`,
+      {
+        request_id: reference,
+        phone,
+        network_id: network,
+        variation_id: plan
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    return {
+      success: response.data.code === 'success',
+      message: response.data.message || 'Data purchase processed'
+    };
+  } catch (error) {
+    console.error('Error processing data purchase:', error.response?.data || error.message);
+    
+    if (error.response && error.response.data) {
+      const vtuError = error.response.data;
+      
+      if (vtuError.message && vtuError.message.toLowerCase().includes('insufficient balance')) {
+        return {
+          success: false,
+          message: 'Insufficient balance for data purchase'
+        };
+      }
+    }
+    
+    return {
+      success: false,
+      message: 'Failed to process data purchase'
+    };
+  }
+}
+
+// Process electricity payment
+async function processElectricityPayment(disco, meter, meterType, amount, reference) {
+  try {
+    const token = await getAccessToken();
+    
+    const response = await axios.post(
+      `${VTU_API_URL}/electricity`,
+      {
+        request_id: reference,
+        meter_number: meter,
+        service_id: disco,
+        variation_id: meterType,
+        amount
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    return {
+      success: response.data.code === 'success',
+      message: response.data.message || 'Electricity payment processed',
+      token: response.data.token || null
+    };
+  } catch (error) {
+    console.error('Error processing electricity payment:', error.response?.data || error.message);
+    
+    if (error.response && error.response.data) {
+      const vtuError = error.response.data;
+      
+      if (vtuError.message && vtuError.message.toLowerCase().includes('insufficient balance')) {
+        return {
+          success: false,
+          message: 'Insufficient balance for electricity payment'
+        };
+      }
+    }
+    
+    return {
+      success: false,
+      message: 'Failed to process electricity payment'
+    };
+  }
+}
+
 // Requery order status
 async function requeryOrder(requestId) {
   try {
@@ -439,6 +641,50 @@ function mapProviderToServiceId(provider) {
   }
 }
 
+// Helper function to map network names to network IDs
+function mapNetworkToNetworkId(network) {
+  switch (network.toLowerCase()) {
+    case 'mtn':
+      return 'mtn';
+    case 'glo':
+      return 'glo';
+    case 'airtel':
+      return 'airtel';
+    case '9mobile':
+      return '9mobile';
+    default:
+      return null;
+  }
+}
+
+// Helper function to map disco names to service IDs
+function mapDiscoToServiceId(disco) {
+  switch (disco.toLowerCase()) {
+    case 'ikeja-electric':
+      return 'ikeja-electric';
+    case 'eko-electric':
+      return 'eko-electric';
+    case 'ibadan-electric':
+      return 'ibadan-electric';
+    case 'kano-electric':
+      return 'kano-electric';
+    case 'portharcourt-electric':
+      return 'portharcourt-electric';
+    case 'abuja-electric':
+      return 'abuja-electric';
+    case 'enugu-electric':
+      return 'enugu-electric';
+    case 'benin-electric':
+      return 'benin-electric';
+    case 'jos-electric':
+      return 'jos-electric';
+    case 'kaduna-electric':
+      return 'kaduna-electric';
+    default:
+      return null;
+  }
+}
+
 // TV Routes
 // Get TV variations
 app.get('/api/services/tv-variations', async (req, res) => {
@@ -446,40 +692,53 @@ app.get('/api/services/tv-variations', async (req, res) => {
     const { provider } = req.query;
     
     if (!provider) {
-      return res.status(400).json({
-        success: false,
-        message: 'Provider is required'
-      });
+      return response(res, false, null, 'Provider is required', 400);
     }
     
     // Map provider names to VTU service IDs
     const serviceId = mapProviderToServiceId(provider);
     if (!serviceId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid provider'
-      });
+      return response(res, false, null, 'Invalid provider', 400);
     }
     
     const variations = await getTvVariations(serviceId);
     
     if (variations.code === 'success') {
-      return res.json({
-        success: true,
-        data: variations.data
-      });
+      return response(res, true, variations.data, 'TV variations fetched successfully');
     } else {
-      return res.status(400).json({
-        success: false,
-        message: variations.message || 'Failed to fetch TV variations'
-      });
+      return response(res, false, null, variations.message || 'Failed to fetch TV variations', 400);
     }
   } catch (error) {
     console.error('Error fetching TV variations:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
+    return response(res, false, null, 'Server error', 500);
+  }
+});
+
+// Get data variations
+app.get('/api/services/data-variations', async (req, res) => {
+  try {
+    const { network } = req.query;
+    
+    if (!network) {
+      return response(res, false, null, 'Network is required', 400);
+    }
+    
+    // Map network names to VTU network IDs
+    const networkId = mapNetworkToNetworkId(network);
+    if (!networkId) {
+      return response(res, false, null, 'Invalid network', 400);
+    }
+    
+    const variations = await getDataVariations(networkId);
+    
+    if (variations.code === 'success') {
+      return response(res, true, variations.data, 'Data variations fetched successfully');
+    } else {
+      return response(res, false, null, variations.message || 'Failed to fetch data variations', 400);
+    }
+  } catch (error) {
+    console.error('Error fetching data variations:', error);
+    return response(res, false, null, 'Server error', 500);
   }
 });
 
@@ -489,19 +748,13 @@ app.get('/api/services/tv-customer', async (req, res) => {
     const { provider, smartcard } = req.query;
     
     if (!provider || !smartcard) {
-      return res.status(400).json({
-        success: false,
-        message: 'Provider and smartcard are required'
-      });
+      return response(res, false, null, 'Provider and smartcard are required', 400);
     }
     
     // Map provider names to VTU service IDs
     const serviceId = mapProviderToServiceId(provider);
     if (!serviceId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid provider'
-      });
+      return response(res, false, null, 'Invalid provider', 400);
     }
     
     const customer = await verifyCustomer(smartcard, serviceId);
@@ -513,22 +766,13 @@ app.get('/api/services/tv-customer', async (req, res) => {
         currentPlan: customer.data.Current_Package || customer.data.current_package || 'Not available'
       };
       
-      return res.json({
-        success: true,
-        data: customerData
-      });
+      return response(res, true, customerData, 'Customer verified successfully');
     } else {
-      return res.status(400).json({
-        success: false,
-        message: customer.message || 'Failed to verify customer'
-      });
+      return response(res, false, null, customer.message || 'Failed to verify customer', 400);
     }
   } catch (error) {
     console.error('Error verifying customer:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
+    return response(res, false, null, 'Server error', 500);
   }
 });
 
@@ -538,19 +782,13 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
     const { provider, smartcard, plan, phone, email } = req.body;
     
     if (!provider || !smartcard || !plan || !phone) {
-      return res.status(400).json({
-        success: false,
-        message: 'All fields are required'
-      });
+      return response(res, false, null, 'All fields are required', 400);
     }
     
     // Map provider names to VTU service IDs
     const serviceId = mapProviderToServiceId(provider);
     if (!serviceId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid provider'
-      });
+      return response(res, false, null, 'Invalid provider', 400);
     }
     
     // Generate a unique request ID
@@ -574,23 +812,41 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
         createdAt: new Date().toISOString()
       };
       
-      return res.json({
-        success: true,
-        data: transactionData,
-        message: result.message || 'TV subscription successful'
+      // Create transaction record
+      const transaction = new Transaction({
+        userId: req.user.id,
+        type: 'tv',
+        amount: result.amount || 0,
+        reference: result.request_id || requestId,
+        status: 'successful',
+        metadata: { 
+          provider, 
+          smartcard, 
+          plan,
+          phone,
+          email
+        }
       });
+      
+      await transaction.save();
+      
+      // Create commission record
+      await createCommission(req.user.id, transaction._id, transaction.amount);
+      
+      // Create notification
+      await new Notification({
+        userId: req.user.id,
+        title: 'TV Subscription Successful',
+        message: `Your TV subscription for ${provider} was successful.`
+      }).save();
+      
+      return response(res, true, transactionData, 'TV subscription successful');
     } else {
-      return res.status(400).json({
-        success: false,
-        message: result.message || 'Failed to purchase TV subscription'
-      });
+      return response(res, false, null, result.message || 'Failed to purchase TV subscription', 400);
     }
   } catch (error) {
     console.error('Error purchasing TV subscription:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Server error'
-    });
+    return response(res, false, null, 'Server error', 500);
   }
 });
 
@@ -1183,6 +1439,9 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
     await transaction.save();
     
     if (result.success) {
+      // Create commission record
+      await createCommission(user._id, transaction._id, amount);
+      
       // Create notification
       await new Notification({
         userId: user._id,
@@ -1272,6 +1531,9 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
     await transaction.save();
     
     if (result.success) {
+      // Create commission record
+      await createCommission(user._id, transaction._id, amount);
+      
       // Create notification
       await new Notification({
         userId: user._id,
@@ -1353,6 +1615,9 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
     await transaction.save();
     
     if (result.success) {
+      // Create commission record
+      await createCommission(user._id, transaction._id, amount);
+      
       // Send token via email and SMS
       if (email) {
         await sendEmail(
@@ -1464,11 +1729,16 @@ app.get('/api/admin/stats', authenticateToken, authorizeRole(['admin', 'super-ad
       ? (successfulTransactions / totalTransactions) * 100 
       : 0;
     
+    const totalCommissions = await Commission.aggregate([
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    
     response(res, true, {
       totalUsers,
       totalTransactions,
       totalVolume: totalVolume[0]?.total || 0,
-      verificationRate: parseFloat(verificationRate.toFixed(1))
+      verificationRate: parseFloat(verificationRate.toFixed(1)),
+      totalCommissions: totalCommissions[0]?.total || 0
     }, 'Admin stats retrieved');
   } catch (err) {
     console.error('ADMIN_STATS_ERR', err);
@@ -1626,6 +1896,11 @@ app.put('/api/admin/transactions/:id/verify', authenticateToken, authorizeRole([
     transaction.status = 'successful';
     await transaction.save();
     
+    // Create commission record if it doesn't exist
+    if (transaction.type !== 'funding') {
+      await createCommission(transaction.userId, transaction._id, transaction.amount);
+    }
+    
     response(res, true, null, 'Transaction verified successfully');
   } catch (err) {
     console.error('ADMIN_VERIFY_TRANSACTION_ERR', err);
@@ -1635,17 +1910,20 @@ app.put('/api/admin/transactions/:id/verify', authenticateToken, authorizeRole([
 
 app.get('/api/admin/commissions', authenticateToken, authorizeRole(['admin', 'super-admin']), async (req, res) => {
   try {
-    const { page = 1, limit = 10 } = req.query;
+    const { page = 1, limit = 10, status } = req.query;
     const skip = (page - 1) * limit;
     
-    const commissions = await Commission.find()
+    let filter = {};
+    if (status) filter.status = status;
+    
+    const commissions = await Commission.find(filter)
       .populate('userId', 'name email')
       .populate('transactionId', 'reference amount')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit));
     
-    const total = await Commission.countDocuments();
+    const total = await Commission.countDocuments(filter);
     
     response(res, true, {
       commissions,
@@ -1910,51 +2188,6 @@ app.get('/api/admin/fund-requests', authenticateToken, authorizeRole(['admin', '
   }
 });
 
-// Service Processing Functions (Simplified for demo)
-async function processAirtimePurchase(network, phone, amount, reference) {
-  // In a real app, this would integrate with a VTpass or similar API
-  console.log(`Processing airtime purchase: ${network} ${phone} ₦${amount} ${reference}`);
-  
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  
-  // Simulate success (90% success rate)
-  if (Math.random() < 0.9) {
-    return { success: true };
-  } else {
-    return { success: false, message: 'Failed to process airtime purchase' };
-  }
-}
-
-async function processDataPurchase(network, phone, plan, reference) {
-  // In a real app, this would integrate with a VTpass or similar API
-  console.log(`Processing data purchase: ${network} ${phone} ${plan} ${reference}`);
-  
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  
-  // Simulate success (90% success rate)
-  if (Math.random() < 0.9) {
-    return { success: true };
-  } else {
-    return { success: false, message: 'Failed to process data purchase' };
-  }
-}
-
-async function processElectricityPayment(disco, meter, meterType, amount, reference) {
-  // In a real app, this would integrate with a VTpass or similar API
-  console.log(`Processing electricity payment: ${disco} ${meter} ${meterType} ₦${amount} ${reference}`);
-  
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  
-  // Simulate success (90% success rate)
-  if (Math.random() < 0.9) {
-    // Generate a random token
-    const token = Math.random().toString(36).substring(2, 15).toUpperCase();
-    return { success: true, token };
-  } else {
-    return { success: false, message: 'Failed to process electricity payment' };
-  }
-}
-
 // Webhook endpoint for VTU.ng
 app.post('/api/webhooks/vtu', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
@@ -1978,6 +2211,11 @@ app.post('/api/webhooks/vtu', express.raw({ type: 'application/json' }), async (
       // Update transaction status
       if (status === 'completed-api') {
         transaction.status = 'successful';
+        
+        // Create commission record if it doesn't exist
+        if (transaction.type !== 'funding') {
+          await createCommission(transaction.userId, transaction._id, transaction.amount);
+        }
       } else if (status === 'refunded') {
         transaction.status = 'failed';
         
