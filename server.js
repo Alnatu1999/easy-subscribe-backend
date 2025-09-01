@@ -1,4 +1,4 @@
-// server.js - Combined version with VTU service and TV routes (UPDATED)
+// server.js - Modified version without node-cache dependency
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -9,7 +9,6 @@ const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
-const NodeCache = require('node-cache'); // Added for caching
 const { connectDB, User, Transaction, AdminRole, Notification, Commission } = require('./db.js');
 
 dotenv.config();
@@ -72,12 +71,11 @@ const VTU_USERNAME = process.env.VTU_USERNAME || 'your_vtu_username';
 const VTU_PASSWORD = process.env.VTU_PASSWORD || 'your_vtu_password';
 const VTU_USER_PIN = process.env.VTU_USER_PIN || 'your_user_pin';
 
-// Cache for access token and TV variations
+// Cache for access token and TV variations (simple in-memory cache)
 let accessToken = null;
 let tokenExpiry = null;
-
-// NEW: Cache for TV variations with TTL (1 hour)
-const tvVariationsCache = new NodeCache({ stdTTL: 3600, checkperiod: 600 });
+let tvVariationsCache = {};
+const CACHE_TTL = 3600000; // 1 hour in milliseconds
 
 // Middleware
 const authenticateToken = (req, res, next) => {
@@ -181,6 +179,7 @@ function generateTokens(user) {
 // VTU Service Functions
 // Get access token from VTU.ng
 async function getAccessToken() {
+  // Check if we have a valid token
   if (accessToken && tokenExpiry && new Date() < tokenExpiry) {
     return accessToken;
   }
@@ -191,6 +190,7 @@ async function getAccessToken() {
     });
     if (response.data.token) {
       accessToken = response.data.token;
+      // Token expires after 7 days, set expiry to 6 days for safety
       tokenExpiry = new Date(Date.now() + 6 * 24 * 60 * 60 * 1000);
       return accessToken;
     } else {
@@ -208,8 +208,10 @@ function validateSmartcardFormat(smartcard, provider) {
     return { valid: false, message: 'Smartcard number is required' };
   }
   
+  // Remove any spaces or dashes
   const cleanCard = smartcard.replace(/[\s-]/g, '');
   
+  // Provider-specific validation
   switch (provider.toLowerCase()) {
     case 'dstv':
       if (!/^\d{10,11}$/.test(cleanCard)) {
@@ -227,6 +229,7 @@ function validateSmartcardFormat(smartcard, provider) {
       }
       break;
     default:
+      // Generic validation for unknown providers
       if (!/^\d{8,15}$/.test(cleanCard)) {
         return { valid: false, message: 'Invalid smartcard number format' };
       }
@@ -235,15 +238,15 @@ function validateSmartcardFormat(smartcard, provider) {
   return { valid: true, message: 'Valid format' };
 }
 
-// Get TV variations (public endpoint, no auth required) - UPDATED WITH CACHING
+// Get TV variations (public endpoint, no auth required) - UPDATED WITH SIMPLE CACHE
 async function getTvVariations(serviceId = null) {
   // Check cache first
   const cacheKey = serviceId || 'all';
-  const cachedData = tvVariationsCache.get(cacheKey);
+  const cachedData = tvVariationsCache[cacheKey];
   
-  if (cachedData) {
+  if (cachedData && (Date.now() - cachedData.timestamp) < CACHE_TTL) {
     console.log(`Returning cached TV variations for: ${cacheKey}`);
-    return cachedData;
+    return cachedData.data;
   }
   
   try {
@@ -254,7 +257,10 @@ async function getTvVariations(serviceId = null) {
     const response = await axios.get(url);
     
     // Cache the response
-    tvVariationsCache.set(cacheKey, response.data);
+    tvVariationsCache[cacheKey] = {
+      data: response.data,
+      timestamp: Date.now()
+    };
     console.log(`Cached TV variations for: ${cacheKey}`);
     
     return response.data;
@@ -266,6 +272,7 @@ async function getTvVariations(serviceId = null) {
 
 // Verify customer (smartcard/IUC number)
 async function verifyCustomer(customerId, serviceId) {
+  // First, validate the format locally
   const formatValidation = validateSmartcardFormat(customerId, serviceId);
   if (!formatValidation.valid) {
     return {
@@ -294,6 +301,7 @@ async function verifyCustomer(customerId, serviceId) {
   } catch (error) {
     console.error('Error verifying customer:', error.response?.data || error.message);
     
+    // Provide more specific error messages based on the error
     if (error.response && error.response.data) {
       const vtuError = error.response.data;
       
@@ -325,6 +333,7 @@ async function verifyCustomer(customerId, serviceId) {
 // Purchase TV subscription
 async function purchaseTvSubscription(requestId, customerId, serviceId, variationId, subscriptionType = 'change') {
   try {
+    // Validate smartcard format before making the purchase
     const formatValidation = validateSmartcardFormat(customerId, serviceId);
     if (!formatValidation.valid) {
       return {
@@ -355,6 +364,7 @@ async function purchaseTvSubscription(requestId, customerId, serviceId, variatio
   } catch (error) {
     console.error('Error purchasing TV subscription:', error.response?.data || error.message);
     
+    // Provide more specific error messages based on the error
     if (error.response && error.response.data) {
       const vtuError = error.response.data;
       
@@ -442,6 +452,7 @@ app.get('/api/services/tv-variations', async (req, res) => {
       });
     }
     
+    // Map provider names to VTU service IDs
     const serviceId = mapProviderToServiceId(provider);
     if (!serviceId) {
       return res.status(400).json({
@@ -484,6 +495,7 @@ app.get('/api/services/tv-customer', async (req, res) => {
       });
     }
     
+    // Map provider names to VTU service IDs
     const serviceId = mapProviderToServiceId(provider);
     if (!serviceId) {
       return res.status(400).json({
@@ -495,6 +507,7 @@ app.get('/api/services/tv-customer', async (req, res) => {
     const customer = await verifyCustomer(smartcard, serviceId);
     
     if (customer.code === 'success') {
+      // Transform the response to match frontend expectations
       const customerData = {
         customerName: customer.data.Customer_Name || customer.data.customer_name || 'Not available',
         currentPlan: customer.data.Current_Package || customer.data.current_package || 'Not available'
@@ -531,6 +544,7 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
       });
     }
     
+    // Map provider names to VTU service IDs
     const serviceId = mapProviderToServiceId(provider);
     if (!serviceId) {
       return res.status(400).json({
@@ -539,6 +553,7 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
       });
     }
     
+    // Generate a unique request ID
     const requestId = `TV-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     
     const result = await purchaseTvSubscription(
@@ -549,6 +564,7 @@ app.post('/api/services/tv', authenticateToken, async (req, res) => {
     );
     
     if (result.code === 'success') {
+      // Transform the response to match frontend expectations
       const transactionData = {
         reference: result.request_id || requestId,
         provider: provider,
@@ -583,6 +599,7 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password, phone } = req.body;
     
+    // Validate input
     const missingField = required({ name, email, password }, ['name', 'email', 'password']);
     if (missingField) {
       return response(res, false, null, `Missing required field: ${missingField}`, 400);
@@ -600,27 +617,32 @@ app.post('/api/auth/register', async (req, res) => {
       return response(res, false, null, 'Password must be at least 8 characters', 400);
     }
     
+    // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return response(res, false, null, 'User already exists', 409);
     }
     
+    // Hash password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
     
+    // Create user
     const user = new User({
       name,
       email,
       password: hashedPassword,
       phone,
-      isActive: true,
-      role: 'user'
+      isActive: true,  // Ensure user is active by default
+      role: 'user'      // Ensure role is set
     });
     
     await user.save();
     
+    // Generate JWT tokens
     const { accessToken, refreshToken } = generateTokens(user);
     
+    // Send welcome email (non-blocking)
     sendEmail(
       email,
       'Welcome to EasySubscribe',
@@ -653,20 +675,24 @@ app.post('/api/auth/login', async (req, res) => {
       return response(res, false, null, 'Missing email or password', 400);
     }
     
+    // Find user
     const user = await User.findOne({ email });
     if (!user) {
       return response(res, false, null, 'Invalid credentials', 401);
     }
     
+    // Check password
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return response(res, false, null, 'Invalid credentials', 401);
     }
     
+    // Check if user is active
     if (!user.isActive) {
       return response(res, false, null, 'Account is deactivated', 403);
     }
     
+    // Generate JWT tokens
     const { accessToken, refreshToken } = generateTokens(user);
     
     response(res, true, {
@@ -726,14 +752,17 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     
     const user = await User.findOne({ email });
     if (!user) {
+      // Don't reveal that the user doesn't exist
       return response(res, true, null, 'If your email is registered, you will receive a password reset link');
     }
     
+    // Generate reset token
     const resetToken = crypto.randomBytes(20).toString('hex');
     user.resetPasswordToken = resetToken;
-    user.resetPasswordExpires = Date.now() + 3600000;
+    user.resetPasswordExpires = Date.now() + 3600000; // 1 hour
     await user.save();
     
+    // Send reset email (non-blocking)
     const resetUrl = `${APP_BASE_URL}/reset-password.html?token=${resetToken}`;
     
     sendEmail(
@@ -775,14 +804,17 @@ app.post('/api/auth/reset-password', async (req, res) => {
       return response(res, false, null, 'Invalid or expired reset token', 400);
     }
     
+    // Hash new password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
     
+    // Update user
     user.password = hashedPassword;
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
     await user.save();
     
+    // Send confirmation email (non-blocking)
     sendEmail(
       user.email,
       'Password Reset Successful',
@@ -822,6 +854,7 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Update user fields
     if (name) user.name = name;
     if (phone) {
       if (!isValidPhone(phone)) {
@@ -865,17 +898,21 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Verify current password
     const isMatch = await bcrypt.compare(currentPassword, user.password);
     if (!isMatch) {
       return response(res, false, null, 'Current password is incorrect', 401);
     }
     
+    // Hash new password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
     
+    // Update password
     user.password = hashedPassword;
     await user.save();
     
+    // Send confirmation email (non-blocking)
     sendEmail(
       user.email,
       'Password Changed Successfully',
@@ -1009,6 +1046,7 @@ app.post('/api/user/fund-request', authenticateToken, async (req, res) => {
   try {
     const { amount, paymentMethod, reference } = req.body;
     
+    // Validate input
     if (!amount || amount <= 0) {
       return response(res, false, null, 'Invalid amount', 400);
     }
@@ -1022,6 +1060,7 @@ app.post('/api/user/fund-request', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Create funding request
     const transaction = new Transaction({
       userId: user._id,
       type: 'funding',
@@ -1037,12 +1076,14 @@ app.post('/api/user/fund-request', authenticateToken, async (req, res) => {
     
     await transaction.save();
     
+    // Create notification for user
     await new Notification({
       userId: user._id,
       title: 'Funding Request Submitted',
       message: `Your funding request of ₦${amount} has been submitted and is pending approval.`
     }).save();
     
+    // Create notification for admins
     const adminUsers = await User.find({ role: { $in: ['admin', 'super-admin'] } });
     for (const admin of adminUsers) {
       await new Notification({
@@ -1111,12 +1152,14 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Check wallet balance
     if (user.walletBalance < amount) {
       return response(res, false, null, 'Insufficient wallet balance', 400);
     }
     
     const reference = generateReference('AIRTIME');
     
+    // Create transaction record
     const transaction = new Transaction({
       userId: user._id,
       type: 'airtime',
@@ -1128,15 +1171,19 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
     
     await transaction.save();
     
+    // Deduct from wallet
     user.walletBalance -= amount;
     await user.save();
     
+    // Process airtime purchase
     const result = await processAirtimePurchase(network, phone, amount, reference);
     
+    // Update transaction status
     transaction.status = result.success ? 'successful' : 'failed';
     await transaction.save();
     
     if (result.success) {
+      // Create notification
       await new Notification({
         userId: user._id,
         title: 'Airtime Purchase Successful',
@@ -1145,9 +1192,11 @@ app.post('/api/services/airtime', authenticateToken, async (req, res) => {
       
       response(res, true, { reference }, 'Airtime purchase successful');
     } else {
+      // Refund wallet if failed
       user.walletBalance += amount;
       await user.save();
       
+      // Create notification
       await new Notification({
         userId: user._id,
         title: 'Airtime Purchase Failed',
@@ -1179,6 +1228,7 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Get plan amount (in a real app, this would come from a database)
     const planAmounts = {
       '1gb': 300,
       '2gb': 500,
@@ -1191,12 +1241,14 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
       return response(res, false, null, 'Invalid plan selected', 400);
     }
     
+    // Check wallet balance
     if (user.walletBalance < amount) {
       return response(res, false, null, 'Insufficient wallet balance', 400);
     }
     
     const reference = generateReference('DATA');
     
+    // Create transaction record
     const transaction = new Transaction({
       userId: user._id,
       type: 'data',
@@ -1208,15 +1260,19 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
     
     await transaction.save();
     
+    // Deduct from wallet
     user.walletBalance -= amount;
     await user.save();
     
+    // Process data purchase
     const result = await processDataPurchase(network, phone, plan, reference);
     
+    // Update transaction status
     transaction.status = result.success ? 'successful' : 'failed';
     await transaction.save();
     
     if (result.success) {
+      // Create notification
       await new Notification({
         userId: user._id,
         title: 'Data Purchase Successful',
@@ -1225,9 +1281,11 @@ app.post('/api/services/data', authenticateToken, async (req, res) => {
       
       response(res, true, { reference }, 'Data purchase successful');
     } else {
+      // Refund wallet if failed
       user.walletBalance += amount;
       await user.save();
       
+      // Create notification
       await new Notification({
         userId: user._id,
         title: 'Data Purchase Failed',
@@ -1263,12 +1321,14 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Check wallet balance
     if (user.walletBalance < amount) {
       return response(res, false, null, 'Insufficient wallet balance', 400);
     }
     
     const reference = generateReference('ELECTRICITY');
     
+    // Create transaction record
     const transaction = new Transaction({
       userId: user._id,
       type: 'electricity',
@@ -1280,16 +1340,20 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
     
     await transaction.save();
     
+    // Deduct from wallet
     user.walletBalance -= amount;
     await user.save();
     
+    // Process electricity payment
     const result = await processElectricityPayment(disco, meter, meterType, amount, reference);
     
+    // Update transaction status
     transaction.status = result.success ? 'successful' : 'failed';
     transaction.metadata.token = result.token;
     await transaction.save();
     
     if (result.success) {
+      // Send token via email and SMS
       if (email) {
         await sendEmail(
           email,
@@ -1301,8 +1365,10 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
         );
       }
       
+      // Send SMS (in a real app, you would integrate with an SMS service)
       console.log(`SMS sent to ${phone}: Your electricity token is ${result.token}`);
       
+      // Create notification
       await new Notification({
         userId: user._id,
         title: 'Electricity Payment Successful',
@@ -1314,9 +1380,11 @@ app.post('/api/services/electricity', authenticateToken, async (req, res) => {
         token: result.token 
       }, 'Electricity payment successful');
     } else {
+      // Refund wallet if failed
       user.walletBalance += amount;
       await user.save();
       
+      // Create notification
       await new Notification({
         userId: user._id,
         title: 'Electricity Payment Failed',
@@ -1455,6 +1523,7 @@ app.put('/api/admin/users/:id', authenticateToken, authorizeRole(['admin', 'supe
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Update user fields
     if (name) user.name = name;
     if (email) {
       if (!isValidEmail(email)) {
@@ -1487,14 +1556,17 @@ app.post('/api/admin/users/reset-password/:id', authenticateToken, authorizeRole
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Generate random password
     const newPassword = Math.random().toString(36).slice(-8);
     
+    // Hash password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
     
     user.password = hashedPassword;
     await user.save();
     
+    // Send email with new password
     await sendEmail(
       user.email,
       'Your Password Has Been Reset',
@@ -1649,6 +1721,7 @@ app.post('/api/admin/fund-wallet', authenticateToken, authorizeRole(['admin', 's
   try {
     const { userId, amount, note } = req.body;
     
+    // Validate input
     if (!userId) {
       return response(res, false, null, 'User ID is required', 400);
     }
@@ -1657,11 +1730,13 @@ app.post('/api/admin/fund-wallet', authenticateToken, authorizeRole(['admin', 's
       return response(res, false, null, 'Invalid amount', 400);
     }
     
+    // Find user
     const user = await User.findById(userId);
     if (!user) {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Create transaction
     const transaction = new Transaction({
       userId: user._id,
       type: 'funding',
@@ -1677,9 +1752,11 @@ app.post('/api/admin/fund-wallet', authenticateToken, authorizeRole(['admin', 's
     
     await transaction.save();
     
+    // Update user wallet
     user.walletBalance += amount;
     await user.save();
     
+    // Create notification for user
     await new Notification({
       userId: user._id,
       title: 'Wallet Funded',
@@ -1702,33 +1779,40 @@ app.put('/api/admin/fund-request/:id/approve', authenticateToken, authorizeRole(
   try {
     const { note } = req.body;
     
+    // Find transaction
     const transaction = await Transaction.findById(req.params.id);
     if (!transaction) {
       return response(res, false, null, 'Transaction not found', 404);
     }
     
+    // Verify it's a funding request
     if (transaction.type !== 'funding') {
       return response(res, false, null, 'Not a funding transaction', 400);
     }
     
+    // Verify it's pending
     if (transaction.status !== 'pending') {
       return response(res, false, null, 'Transaction already processed', 400);
     }
     
+    // Find user
     const user = await User.findById(transaction.userId);
     if (!user) {
       return response(res, false, null, 'User not found', 404);
     }
     
+    // Update transaction
     transaction.status = 'successful';
     transaction.metadata.approvedBy = req.user.id;
     transaction.metadata.approvalDate = new Date();
     transaction.metadata.note = note;
     await transaction.save();
     
+    // Update user wallet
     user.walletBalance += transaction.amount;
     await user.save();
     
+    // Create notification for user
     await new Notification({
       userId: user._id,
       title: 'Funding Request Approved',
@@ -1751,25 +1835,30 @@ app.put('/api/admin/fund-request/:id/reject', authenticateToken, authorizeRole([
   try {
     const { reason } = req.body;
     
+    // Find transaction
     const transaction = await Transaction.findById(req.params.id);
     if (!transaction) {
       return response(res, false, null, 'Transaction not found', 404);
     }
     
+    // Verify it's a funding request
     if (transaction.type !== 'funding') {
       return response(res, false, null, 'Not a funding transaction', 400);
     }
     
+    // Verify it's pending
     if (transaction.status !== 'pending') {
       return response(res, false, null, 'Transaction already processed', 400);
     }
     
+    // Update transaction
     transaction.status = 'failed';
     transaction.metadata.rejectedBy = req.user.id;
     transaction.metadata.rejectionDate = new Date();
     transaction.metadata.rejectionReason = reason;
     await transaction.save();
     
+    // Create notification for user
     await new Notification({
       userId: transaction.userId,
       title: 'Funding Request Rejected',
@@ -1823,10 +1912,12 @@ app.get('/api/admin/fund-requests', authenticateToken, authorizeRole(['admin', '
 
 // Service Processing Functions (Simplified for demo)
 async function processAirtimePurchase(network, phone, amount, reference) {
+  // In a real app, this would integrate with a VTpass or similar API
   console.log(`Processing airtime purchase: ${network} ${phone} ₦${amount} ${reference}`);
   
   await new Promise(resolve => setTimeout(resolve, 1000));
   
+  // Simulate success (90% success rate)
   if (Math.random() < 0.9) {
     return { success: true };
   } else {
@@ -1835,10 +1926,12 @@ async function processAirtimePurchase(network, phone, amount, reference) {
 }
 
 async function processDataPurchase(network, phone, plan, reference) {
+  // In a real app, this would integrate with a VTpass or similar API
   console.log(`Processing data purchase: ${network} ${phone} ${plan} ${reference}`);
   
   await new Promise(resolve => setTimeout(resolve, 1000));
   
+  // Simulate success (90% success rate)
   if (Math.random() < 0.9) {
     return { success: true };
   } else {
@@ -1847,11 +1940,14 @@ async function processDataPurchase(network, phone, plan, reference) {
 }
 
 async function processElectricityPayment(disco, meter, meterType, amount, reference) {
+  // In a real app, this would integrate with a VTpass or similar API
   console.log(`Processing electricity payment: ${disco} ${meter} ${meterType} ₦${amount} ${reference}`);
   
   await new Promise(resolve => setTimeout(resolve, 1000));
   
+  // Simulate success (90% success rate)
   if (Math.random() < 0.9) {
+    // Generate a random token
     const token = Math.random().toString(36).substring(2, 15).toUpperCase();
     return { success: true, token };
   } else {
@@ -1865,22 +1961,27 @@ app.post('/api/webhooks/vtu', express.raw({ type: 'application/json' }), async (
     const signature = req.headers['x-signature'];
     const payload = JSON.parse(req.body);
     
+    // Verify the webhook signature
     const isValid = verifyWebhookSignature(payload, signature);
     
     if (!isValid) {
       return response(res, false, null, 'Invalid signature', 403);
     }
     
+    // Process the webhook
     const { order_id, status, request_id } = payload;
     
+    // Find the transaction by reference
     const transaction = await Transaction.findOne({ reference: request_id });
     
     if (transaction) {
+      // Update transaction status
       if (status === 'completed-api') {
         transaction.status = 'successful';
       } else if (status === 'refunded') {
         transaction.status = 'failed';
         
+        // Refund the user if not already refunded
         const user = await User.findById(transaction.userId);
         if (user && transaction.status !== 'refunded') {
           user.walletBalance += transaction.amount;
@@ -1890,6 +1991,7 @@ app.post('/api/webhooks/vtu', express.raw({ type: 'application/json' }), async (
       
       await transaction.save();
       
+      // Create notification
       await new Notification({
         userId: transaction.userId,
         title: `TV Subscription ${status === 'completed-api' ? 'Successful' : 'Failed'}`,
@@ -1897,6 +1999,7 @@ app.post('/api/webhooks/vtu', express.raw({ type: 'application/json' }), async (
       }).save();
     }
     
+    // Respond to VTU.ng
     res.status(200).json({ status: 'success' });
   } catch (error) {
     console.error('VTU Webhook Error:', error);
